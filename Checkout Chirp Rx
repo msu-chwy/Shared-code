@@ -1,0 +1,593 @@
+
+
+set (startdate, enddate) = ('2023-02-16','2023-02-22');
+
+
+create or replace local temp table ecom_sandbox.sfw_exp_pop_rx_dw on commit preserve rows as
+with testing as (
+select
+    * from (
+    select ga.*, '2023-02-16' as start_date, '2023-02-22' as end_date,
+    customer_id as exp_user_id,
+    dense_rank() over(
+        partition by customer_id,
+        event_action,
+        event_label
+        order by
+            hit_timestamp
+    ) as act_rank
+from
+    ga.ga_sessions_hits ga
+    /*inner join ecom_sandbox.pca_sfw_experiments as exp
+        on ga.event_action = exp.test
+        and exp.start_date <= ga_sessions_date 
+        and (exp.end_date >= ga_sessions_date or exp.end_date is null)*/
+where
+    ga_sessions_date between '2023-02-16' and '2023-02-22'
+    and load_type = 'daily'
+    and is_bot = false
+    and dataset = 'web'
+    and event_value = 1
+    and event_category = 'optimizely' 
+    and event_action = '2022_07_CHECKOUT_CHIRP'
+    -- and event_action in ('2022_03_AS_ADD_MORE_ITEM', '2022_01_AS_SKIP_ITEM')
+    --and (not is_completed or (is_completed and end_date = (select max(ga_sessions_date) as data_date from ga.ga_sessions where ga_sessions_date >= '2022-1-1' and load_type = 'daily')))
+) as ranked
+where
+act_rank = 1),
+
+all_hits as (
+    select *,
+    customer_id as exp_user_id
+from
+    ga.ga_sessions_hits ga
+    inner join ecom_sandbox.pca_sfw_experiments as exp
+        on ga.event_action = exp.test
+        and exp.start_date <= ga_sessions_date 
+        and (exp.end_date >= ga_sessions_date or exp.end_date is null)
+where
+    ga_sessions_date between '2023-02-16' and '2023-02-22'
+    and load_type = 'daily'
+    and is_bot = false
+    and dataset = 'web'
+    and event_category = 'optimizely' 
+    and event_action = '2022_07_CHECKOUT_CHIRP'
+    --and (not is_completed or (is_completed and end_date = (select max(ga_sessions_date) as data_date from ga.ga_sessions where ga_sessions_date >= '2022-1-1' and load_type = 'daily'))) 
+),
+
+-- identify the population that got activated into more than 1 treatment/control groups
+spillover as (
+select event_action, exp_user_id from all_hits
+    group by event_action, exp_user_id
+    having count(distinct event_label) > 1)
+
+
+select testing.ga_sessions_date, testing.event_action as Test, testing.event_label as Variation, testing.unique_visit_id, testing.exp_user_id, testing.page_path, min(testing.hit_number) as activation_hit_number,  min(testing.hit_timestamp) as activation_time, lead(min(testing.hit_number), 1)over(partition by testing.unique_visit_id order by min(testing.hit_timestamp)) as next_activation, min(testing.start_date) as start_date, max(testing.end_date) as end_date
+from testing 
+left join spillover
+on testing.event_action = spillover.event_action and testing.exp_user_id = spillover.exp_user_id
+where spillover.event_action is null
+group by 1,2,3,4,5,6;
+
+// #1
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_PCA_CUSTOMER_MC1_ORDER_SNAPSHOT as
+select snapshot_date,customer_id, rx_lifetime_flag
+from ecom_sandbox.PCA_CUSTOMER_MC1_ORDER_SNAPSHOT
+where snapshot_date between $startdate and $enddate
+;
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_ga_sessions_hits_products AS
+SELECT
+    h.ga_sessions_date session_date,
+    pop.unique_visit_id session_id,
+    h.customer_id,
+    authentication_state,
+    case when h.customer_id is not null then h.unique_visit_id||'-'||h.customer_id else session_id end customer_session_id,
+    dataset,
+    pop.test,
+    pop.variation,
+    'GA' data_provider,
+    channel_grouping,
+    channel,
+    traffic_source_source   source,
+    traffic_source_medium   medium,
+    traffic_source_campaign campaign,
+    device_category,
+    new_customer_flag,
+    active_autoship_flag,
+    tried_autoship_flag,
+    unique_hit_id hit_id,
+    hit_timestamp,
+    h.type,
+    h.page_path,
+    page_title,
+    event_category,
+    event_label,
+    event_action,
+    list_category,
+    plp_session ,
+    pdp_session ,
+    atc_session ,
+    checkout_session,
+    purchase_session,
+    transaction_id,  
+    (CASE
+        WHEN (rx_lifetime_flag = false or rx_lifetime_flag is null  
+              //this means that customer has not purchased Rx before
+                 or h.customer_id is null or h.customer_id = 0 
+                 or co.customer_id is null or co.customer_id = 0)
+            THEN True                                               
+            //True means the customer is new to Rx in its lifetime
+        ELSE False
+        END) new_to_rx_lifetime_flag,       
+    (case 
+         when
+            h.event_category = 'eec'
+            and h.event_action = 'checkout'
+    then 'checkouts' end) checkout_event_category,
+    CASE
+        WHEN transaction_id IS NOT NULL
+        AND event_action = 'purchase'
+        THEN COALESCE(transaction_revenue,0)
+        ELSE 0
+    END transaction_revenue
+FROM
+    ga.GA_SESSIONS_HITS_PRODUCTS_UNION h
+    inner join  ecom_sandbox.sfw_exp_pop_rx_dw pop
+    on h.unique_visit_id = pop.unique_visit_id
+    left join pdm.Product p
+on h.product_id=p.product_id
+left join ecom_sandbox.tmp_PCA_CUSTOMER_MC1_ORDER_SNAPSHOT co
+on h.customer_id = co.customer_id
+and h.ga_sessions_date = co.snapshot_date
+WHERE
+h.ga_sessions_date between $startdate and $enddate
+and DATASET = 'web'
+and not  is_bot
+and MERCH_CLASSIFICATION2 ='Pharmacy'
+;
+
+
+// #2
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_session_hits_products_aggregate AS
+SELECT
+    session_date,
+    session_id,
+    customer_id,
+    customer_session_id,
+    dataset,
+    data_provider,
+    test,
+    variation,
+    channel_grouping,
+    channel,
+    source,
+    medium,
+    campaign,
+    device_category,
+    new_customer_flag,
+    active_autoship_flag,
+    tried_autoship_flag,
+    new_to_rx_lifetime_flag,
+    max(
+            CASE
+                WHEN customer_id is not null and customer_id <> 0
+                    THEN true else false
+                END)  AS derived_recognized_session_flag,
+    max(
+            CASE
+                WHEN authentication_state IN ('fully-authenticated',
+                                              'authenticated')
+                    THEN true else false
+                END)  AS derived_login_session_flag,
+
+    COUNT(DISTINCT case when page_title ='Pet Food, Products, Supplies at Low Prices - Free Shipping | Chewy.com' 
+          AND type = 'PAGE' 
+          then hit_id end) as home_page_hits,
+    COUNT(DISTINCT concat('https://www.chewy.com',page_path) ) as page_hits,
+    COUNT (DISTINCT
+           CASE
+               WHEN event_category = 'eec' AND event_action = 'impression'
+                  AND (list_category LIKE 'brand%'
+                        OR  list_category LIKE 'browse%'
+                        OR  list_category LIKE 'search%'
+                        OR  list_category LIKE'deals%'
+                        OR  list_category LIKE 'campaign%')
+           THEN hit_id
+           END) AS plp_hits,
+    COUNT(DISTINCT
+    CASE
+        WHEN event_category = 'eec'
+        AND event_action='detail'
+        AND event_label IN ('In Stock',
+                            'Out of Stock')
+        THEN hit_id
+    END) AS pdp_hits,
+    COUNT(DISTINCT
+    CASE
+        WHEN event_category = 'eec'
+            AND event_action='detail'
+            AND event_label= 'Out of Stock'
+        THEN hit_id
+    END) as oos_pdp_hits,
+    COUNT(DISTINCT
+    CASE
+        WHEN event_category = 'eec'
+        AND event_action = 'addToCart'
+        THEN hit_id
+    END) AS atc_hits,
+    COUNT(DISTINCT
+    CASE
+        WHEN checkout_event_category = 'checkouts'
+        THEN hit_id
+    END) checkout_hits,
+    COUNT(DISTINCT
+    CASE
+        WHEN event_action = 'purchase'
+        THEN hit_id
+    END) purchase_hits,
+    COUNT(DISTINCT
+    CASE
+        WHEN event_action = 'purchase'
+        AND transaction_id IS NOT NULL
+        THEN transaction_id
+    END) AS rx_orders,
+    ROUND(SUM(
+        CASE
+            WHEN event_action = 'purchase'
+            AND transaction_id IS NOT NULL
+            THEN transaction_revenue
+            ELSE 0
+        END),2) rx_order_total_sales
+
+FROM
+    ecom_sandbox.tmp_ga_sessions_hits_products
+GROUP BY
+    1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18
+;
+
+
+
+// #3
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_success_hits_src AS
+SELECT
+    *
+FROM
+    (
+        WITH
+            plp_success_hits AS
+                (
+                    SELECT
+                        *
+                    FROM
+                        ecom_sandbox.tmp_ga_sessions_hits_products
+                    WHERE
+                    (
+                            (event_category = 'eec'
+                                AND event_action = 'impression'
+                                AND (list_category LIKE 'brand%'
+                        OR  list_category LIKE 'browse%'
+                        OR  list_category LIKE 'search%'
+                        OR  list_category LIKE'deals%'
+                        OR  list_category LIKE 'campaign%')
+                                )
+                            OR 
+                            (event_category = 'eec'
+                            AND event_action = 'detail'
+                            AND event_label IN ('In Stock',
+                                                'Out of Stock')
+                                )
+                        )
+                )
+        SELECT
+            'plp_success_hits' success_hits,
+            session_id,
+            match_number
+        FROM
+            plp_success_hits match_recognize 
+            ( 
+              partition BY session_id ORDER BY hit_timestamp
+            measures match_number() AS match_number one row per MATCH pattern(plp_hit pdp_hit)
+            define plp_hit          AS event_category = 'eec'
+             AND event_action = 'impression'
+              AND (list_category LIKE 'brand%'
+                        OR  list_category LIKE 'browse%'
+                        OR  list_category LIKE 'search%'
+                        OR  list_category LIKE'deals%'
+                        OR  list_category LIKE 'campaign%'),
+              pdp_hit AS event_category = 'eec'
+                 AND event_action='detail'
+                 AND event_label IN ('In Stock',
+                            'Out of Stock')
+                )
+        ORDER BY
+            match_number )
+UNION ALL
+SELECT
+    *
+FROM
+    (
+        WITH
+            pdp_success_hits AS
+                (
+                    SELECT
+                        *
+                    FROM
+                        ecom_sandbox.tmp_ga_sessions_hits_products
+                    WHERE
+                        (
+                                    event_category = 'eec'
+                                AND event_action = 'detail'
+                                AND event_label IN ('In Stock',
+                                                    'Out of Stock')
+                            )
+                       OR  (
+                                event_category ='eec'
+                            AND event_action = 'addToCart')
+                )
+        SELECT
+            'pdp_success_hits' success_hits,
+            session_id,
+            match_number
+        FROM
+            pdp_success_hits match_recognize( partition BY session_id ORDER BY hit_timestamp
+            measures match_number() AS match_number one row per MATCH pattern(pdp_hit atc_hit)
+            define pdp_hit          AS event_category = 'eec'
+        AND event_action = 'detail'
+        AND event_label IN ('In Stock',
+                            'Out of Stock')
+                , atc_hit AS event_category ='eec'
+        AND event_action = 'addToCart')
+        ORDER BY
+            match_number )
+UNION ALL
+SELECT
+    *
+FROM
+    (
+        WITH
+            atc_success_hits AS
+                (
+                    SELECT
+                        *
+                    FROM
+                        ecom_sandbox.tmp_ga_sessions_hits_products
+                    WHERE
+                        (event_category = 'eec' AND event_action = 'addToCart')
+                       OR (checkout_event_category = 'checkouts')
+                )
+        SELECT
+            'atc_success_hits' success_hits,
+            session_id,
+            match_number
+        FROM
+            atc_success_hits match_recognize( partition BY session_id ORDER BY hit_timestamp
+            measures match_number()  AS match_number one row per MATCH pattern(atc_hit checkout_hit)
+            define atc_hit                              AS event_category = 'eec'
+        AND event_action = 'addToCart', checkout_hit AS checkout_event_category = 'checkouts')
+        ORDER BY
+            match_number )
+UNION ALL
+SELECT
+    *
+FROM
+    (
+        WITH
+            checkout_success_hits AS
+                (
+                    SELECT
+                        *
+                    FROM
+                        ecom_sandbox.tmp_ga_sessions_hits_products
+                    WHERE
+                            checkout_event_category = 'checkouts'
+                       OR (event_category = 'eec' AND event_action = 'purchase')
+                )
+        SELECT
+            'checkout_success_hits' success_hits,
+            session_id,
+            match_number
+        FROM
+            checkout_success_hits match_recognize( partition BY session_id ORDER BY
+            hit_timestamp measures match_number()          AS match_number one row per MATCH pattern
+            (checkout_hit purchase_hit) define checkout_hit AS checkout_event_category = 'checkouts',
+                                                   purchase_hit      AS event_category = 'eec' AND event_action = 'purchase')
+        ORDER BY
+            match_number ) 
+            ;
+
+// #4
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_success_hits_aggregate AS
+WITH
+    t1 AS
+    (
+        SELECT
+            session_id,
+            success_hits,
+            MAX(match_number) match_number
+        FROM
+            ecom_sandbox.tmp_success_hits_src
+        GROUP BY 1,2
+    )
+SELECT
+    session_id,
+    SUM(
+        CASE
+            WHEN success_hits = 'plp_success_hits'
+            THEN match_number
+            ELSE 0
+        END ) plp_success_hits,
+    SUM(
+        CASE
+            WHEN success_hits = 'pdp_success_hits'
+            THEN match_number
+            ELSE 0
+        END ) pdp_success_hits,
+    SUM(
+        CASE
+            WHEN success_hits = 'atc_success_hits'
+            THEN match_number
+            ELSE 0
+        END) atc_success_hits,
+    SUM(
+        CASE
+            WHEN success_hits = 'checkout_success_hits'
+            THEN match_number
+            ELSE 0
+        END) checkout_success_hits
+FROM
+    t1
+GROUP BY
+    1 ;
+
+// #5
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_success_hits_final AS
+SELECT
+    session_id,
+    plp_success_hits,
+    pdp_success_hits,
+    atc_success_hits,
+    checkout_success_hits,
+    CASE
+        WHEN plp_success_hits > 0
+        THEN true
+        ELSE false
+    END plp_success_session,
+    CASE
+        WHEN pdp_success_hits > 0
+        THEN true
+        ELSE false
+    END pdp_success_session,
+    CASE
+        WHEN atc_success_hits > 0
+        THEN true
+        ELSE false
+    END atc_success_session,
+    CASE
+        WHEN checkout_success_hits > 0
+        THEN true
+        ELSE false
+    END checkout_success_session
+FROM
+    ecom_sandbox.tmp_success_hits_aggregate;
+
+    
+
+// #6
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_sfw_rx_session_aggregate AS
+SELECT
+    gh.session_date,
+    data_provider,
+    dataset,
+    gh.session_id,
+    gh.customer_id,
+    gh.test,
+    gh.variation,
+    customer_session_id,
+    new_customer_flag,
+    active_autoship_flag,
+    tried_autoship_flag,
+//New Additional Flag
+    new_to_rx_lifetime_flag,
+    derived_recognized_session_flag recognized_session_flag,
+    derived_login_session_flag login_session_flag,
+    device_category,
+    channel_grouping,
+    channel,
+    source,
+    medium,
+    campaign,
+    (case when plp_hits > 0 then TRUE else FALSE end) rx_plp_session,
+    (case when pdp_hits > 0 then TRUE else FALSE end) rx_pdp_session,
+    (case when atc_hits > 0 then TRUE else FALSE end) rx_atc_session,
+    (case when checkout_hits > 0 then TRUE else FALSE end) rx_checkout_session,
+    (case when purchase_hits > 0 then TRUE else FALSE end) rx_purchase_session,
+
+    COALESCE(sh.plp_success_hits,0)      rx_plp_success_hits ,
+    COALESCE(sh.pdp_success_hits,0)      rx_pdp_success_hits ,
+    COALESCE(sh.atc_success_hits,0)      rx_atc_success_hits ,
+    COALESCE(sh.checkout_success_hits,0) rx_checkout_success_hits ,
+    sh.plp_success_session as rx_plp_success_session,
+    sh.pdp_success_session as rx_pdp_success_session,
+    sh.atc_success_session as rx_atc_success_session,
+    sh.checkout_success_session as rx_checkout_success_session,
+    COALESCE(rx_orders,0)                                 rx_orders ,
+    COALESCE(rx_order_total_sales,0)                      rx_order_total_sales
+
+FROM
+    ecom_sandbox.tmp_session_hits_products_aggregate gh
+LEFT JOIN
+    ecom_sandbox.tmp_success_hits_final sh
+ON
+    gh.session_id = sh.session_id
+;
+
+
+
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.tmp_CLICKSTREAM_SFW_RX_PRODUCTS_AGGREGATE_DAILY_EXP_modal as
+select
+    test,
+    variation,
+    new_to_rx_lifetime_flag,
+    device_category,
+    COUNT(DISTINCT SESSION_ID) RX_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN rx_plp_session
+                  THEN SESSION_ID
+              END) RX_PLP_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN rx_pdp_session
+                  THEN SESSION_ID
+              END) RX_PDP_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN rx_atc_session
+                  THEN SESSION_ID
+              END) RX_ATC_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN rx_checkout_session
+                  THEN SESSION_ID
+              END) RX_CHECKOUT_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN rx_purchase_session
+                  THEN SESSION_ID
+              END)  RX_PURCHASE_SESSIONS,
+
+    COUNT(DISTINCT
+          CASE
+              WHEN rx_plp_success_session
+                  THEN SESSION_ID
+              END) RX_PLP_SUCCESS_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN rx_pdp_success_session
+                  THEN SESSION_ID
+              END) rx_PDP_SUCCESS_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN rx_atc_success_session
+                  THEN SESSION_ID
+              END) RX_ATC_SUCCESS_SESSIONS,
+    COUNT(DISTINCT
+          CASE
+              WHEN rx_checkout_success_session
+                  THEN SESSION_ID
+              END)  RX_CHECKOUT_SUCCESS_SESSIONS,
+     SUM(rx_orders)                           RX_ORDERS
+     from ecom_sandbox.tmp_sfw_rx_session_aggregate
+     where session_date between $startdate and $enddate
+     group by 1,2,3,4
+     ;
+     
+SELECT * FROM ecom_sandbox.tmp_CLICKSTREAM_SFW_RX_PRODUCTS_AGGREGATE_DAILY_EXP_modal;
